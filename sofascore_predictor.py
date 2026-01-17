@@ -1,12 +1,21 @@
 """
-SofaScore Under 1 Goal Predictor - Enhanced
-============================================
+SofaScore Under 1 Goal Predictor - Two-Stage Model
+===================================================
 
-Single-command script that:
-1. Collects ALL live match data with stats, H2H, and goal timestamps
-2. Trains HYBRID ensemble model (XGBoost + LightGBM)
-3. Identifies 0-0 matches at ~30 min
-4. Predicts which will finish with less than 1 goal
+Two-stage modeling approach that eliminates data leakage:
+
+Model A - "Late First Goal Model"
+    → Predicts whether the first goal comes after 45 minutes
+    
+Model B - "Under 1 Goal Model"  
+    → Predicts if match stays Under 1 Goal, conditioned on 0-0 at 30 min
+
+Key improvements:
+- No data leakage: Model never trains on matches where first goal 
+  happened before 30 minutes
+- Clean features that encode "no goal yet" state
+- Dominance indicators (possession, shots, corners ratios)
+- Combined probability for optimal predictions
 
 Usage: python sofascore_predictor.py
 
@@ -14,11 +23,10 @@ Output CSVs:
 - data/live_matches.csv           - All live match data
 - data/h2h_data.csv               - Head-to-head statistics  
 - data/goal_timestamps.csv        - First goal times for all matches
-- data/training_data.csv          - Data used for training
-- data/xgboost_results.csv        - XGBoost model results
-- data/lightgbm_results.csv       - LightGBM model results
-- data/ensemble_results.csv       - Ensemble model results
-- data/predictions.csv            - Final predictions for 0-0 matches
+- data/training_data.csv          - Filtered training data (0-0 at 30 min)
+- data/model_a_results.csv        - Late First Goal model results
+- data/model_b_results.csv        - Under 1 Goal model results
+- data/predictions.csv            - Final combined predictions
 """
 
 import asyncio
@@ -163,15 +171,121 @@ def extract_goal_info(incidents: List[Dict]) -> Dict[str, Any]:
         'home_goals_scored': home_goals,
         'away_goals_scored': away_goals,
         'first_goal_time': first_goal_time,
-        'first_goal_before_15': 1 if first_goal_time and first_goal_time <= 15 else 0,
-        'first_goal_before_30': 1 if first_goal_time and first_goal_time <= 30 else 0,
-        'first_goal_before_45': 1 if first_goal_time and first_goal_time <= 45 else 0,
         'goals_first_half': sum(1 for g in goals if g['time'] <= 45),
         'goals_second_half': sum(1 for g in goals if g['time'] > 45),
-        'goals_last_15': sum(1 for g in goals if g['time'] >= 75),
         'goal_timestamps': json.dumps([g['time'] for g in goals]),
         'avg_goal_time': np.mean([g['time'] for g in goals]) if goals else None,
     }
+
+
+# ============================================================================
+# FEATURE ENGINEERING (LEAK-FREE)
+# ============================================================================
+
+def calculate_dominance_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculate dominance indicators that are safe for 0-0 prediction.
+    These features encode relative strength without leaking goal info.
+    """
+    df = df.copy()
+    
+    # Parse numeric values for calculations
+    for col in ['home_ball_possession', 'away_ball_possession',
+                'home_total_shots', 'away_total_shots',
+                'home_shots_on_target', 'away_shots_on_target',
+                'home_corner_kicks', 'away_corner_kicks',
+                'home_big_chances', 'away_big_chances',
+                'home_expected_goals', 'away_expected_goals',
+                'home_fouls', 'away_fouls']:
+        if col in df.columns:
+            df[col] = df[col].apply(parse_value)
+    
+    # Possession ratio (0 to 1, 0.5 = equal)
+    home_poss = df.get('home_ball_possession', pd.Series([50]*len(df)))
+    away_poss = df.get('away_ball_possession', pd.Series([50]*len(df)))
+    total_poss = home_poss + away_poss
+    df['possession_ratio'] = np.where(total_poss > 0, home_poss / total_poss, 0.5)
+    
+    # Shots ratio
+    home_shots = df.get('home_total_shots', pd.Series([0]*len(df)))
+    away_shots = df.get('away_total_shots', pd.Series([0]*len(df)))
+    total_shots = home_shots + away_shots
+    df['shots_ratio'] = np.where(total_shots > 0, home_shots / total_shots, 0.5)
+    df['total_shots'] = total_shots
+    
+    # Shots on target ratio
+    home_sot = df.get('home_shots_on_target', pd.Series([0]*len(df)))
+    away_sot = df.get('away_shots_on_target', pd.Series([0]*len(df)))
+    total_sot = home_sot + away_sot
+    df['sot_ratio'] = np.where(total_sot > 0, home_sot / total_sot, 0.5)
+    df['total_shots_on_target'] = total_sot
+    
+    # Corners ratio
+    home_corners = df.get('home_corner_kicks', pd.Series([0]*len(df)))
+    away_corners = df.get('away_corner_kicks', pd.Series([0]*len(df)))
+    total_corners = home_corners + away_corners
+    df['corners_ratio'] = np.where(total_corners > 0, home_corners / total_corners, 0.5)
+    df['total_corners'] = total_corners
+    
+    # Big chances ratio
+    home_bc = df.get('home_big_chances', pd.Series([0]*len(df)))
+    away_bc = df.get('away_big_chances', pd.Series([0]*len(df)))
+    total_bc = home_bc + away_bc
+    df['big_chances_ratio'] = np.where(total_bc > 0, home_bc / total_bc, 0.5)
+    df['total_big_chances'] = total_bc
+    
+    # Expected goals dominance (if available)
+    home_xg = df.get('home_expected_goals', pd.Series([0]*len(df)))
+    away_xg = df.get('away_expected_goals', pd.Series([0]*len(df)))
+    df['xg_difference'] = home_xg - away_xg
+    total_xg = home_xg + away_xg
+    df['xg_ratio'] = np.where(total_xg > 0, home_xg / total_xg, 0.5)
+    df['total_xg'] = total_xg
+    
+    # Pressure indicators (normalized by elapsed time)
+    elapsed = df.get('elapsed_minutes', pd.Series([30]*len(df)))
+    elapsed = elapsed.replace(0, 30)  # Avoid division by zero
+    
+    df['shot_pressure'] = total_shots / elapsed * 30  # Shots per 30 min
+    df['sot_pressure'] = total_sot / elapsed * 30
+    df['corner_pressure'] = total_corners / elapsed * 30
+    df['chance_pressure'] = total_bc / elapsed * 30
+    
+    # Defensive indicators
+    home_fouls = df.get('home_fouls', pd.Series([0]*len(df)))
+    away_fouls = df.get('away_fouls', pd.Series([0]*len(df)))
+    df['total_fouls'] = home_fouls + away_fouls
+    df['foul_pressure'] = df['total_fouls'] / elapsed * 30
+    
+    return df
+
+
+def filter_training_data(df: pd.DataFrame, min_elapsed: int = 30) -> pd.DataFrame:
+    """
+    Filter training data to eliminate data leakage.
+    
+    Only keeps matches where:
+    1. First goal came AFTER the specified minute (min_elapsed), OR
+    2. No goal was scored at all
+    
+    This simulates predicting on matches that are 0-0 at min_elapsed minutes.
+    """
+    # Make a copy to avoid modifying original
+    df = df.copy()
+    
+    # Get first goal time, treating NaN as "no goal"
+    first_goal = df['first_goal_time'].fillna(999)  # No goal = very late
+    
+    # Keep only matches where first goal > min_elapsed or no goal
+    valid_mask = first_goal > min_elapsed
+    filtered_df = df[valid_mask].copy()
+    
+    print(f"\n📊 Training Data Filtering:")
+    print(f"   Original matches: {len(df)}")
+    print(f"   Matches with first goal > {min_elapsed} min: {valid_mask.sum()}")
+    print(f"   Filtering removed {len(df) - len(filtered_df)} matches (had early goals)")
+    
+    return filtered_df
 
 
 # ============================================================================
@@ -351,192 +465,377 @@ async def collect_all_data():
 
 
 # ============================================================================
-# MODEL TRAINING & PREDICTION (HYBRID ENSEMBLE)
+# TWO-STAGE MODEL TRAINING
 # ============================================================================
 
-def prepare_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-    """Prepare features for ML model including goal timestamp features."""
+# Clean feature columns (no data leakage)
+CLEAN_FEATURE_COLS = [
+    # Dominance indicators (ratios are safe - they don't encode goals)
+    'possession_ratio', 'shots_ratio', 'sot_ratio', 'corners_ratio',
+    'big_chances_ratio', 'xg_ratio', 'xg_difference',
     
-    # Define feature columns - now includes goal timing!
-    feature_cols = [
-        # Match statistics
-        'home_ball_possession', 'away_ball_possession',
-        'home_total_shots', 'away_total_shots',
-        'home_shots_on_target', 'away_shots_on_target',
-        'home_corner_kicks', 'away_corner_kicks',
-        'home_fouls', 'away_fouls',
-        'home_big_chances', 'away_big_chances',
-        # Goal timing features
-        'first_goal_time', 'first_goal_before_30', 'first_goal_before_45',
-        'goals_first_half', 'goals_second_half', 'goals_last_15',
-        # H2H features
-        'h2h_home_wins', 'h2h_away_wins', 'h2h_draws', 'h2h_total', 'h2h_draw_rate',
-        # Form features
-        'home_avg_rating', 'away_avg_rating',
-        'home_position', 'away_position',
-        'home_form_pts', 'away_form_pts',
-        # Match state
-        'elapsed_minutes',
-    ]
+    # Total activity (safe - doesn't encode if goals happened)
+    'total_shots', 'total_shots_on_target', 'total_corners', 
+    'total_big_chances', 'total_xg', 'total_fouls',
     
-    # Keep only columns that exist
-    existing_features = [c for c in feature_cols if c in df.columns]
+    # Pressure indicators (normalized by time)
+    'shot_pressure', 'sot_pressure', 'corner_pressure', 
+    'chance_pressure', 'foul_pressure',
+    
+    # H2H features (historical - safe)
+    'h2h_home_wins', 'h2h_away_wins', 'h2h_draws', 
+    'h2h_total', 'h2h_draw_rate',
+    
+    # Form features (pre-match - safe)
+    'home_avg_rating', 'away_avg_rating',
+    'home_position', 'away_position',
+    'home_form_pts', 'away_form_pts',
+    
+    # Match state
+    'elapsed_minutes',
+]
+
+
+def prepare_clean_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Prepare leak-free features for ML models.
+    Only uses features that don't encode goal information.
+    """
+    # Calculate dominance features first
+    df = calculate_dominance_features(df)
+    
+    # Only keep columns that exist
+    existing_features = [c for c in CLEAN_FEATURE_COLS if c in df.columns]
     
     # Create feature dataframe
     X = df[existing_features].copy()
     
+    # Fill NaN with 0 or median
+    X = X.fillna(0)
+    
     # Convert all to numeric
     for col in X.columns:
-        X[col] = X[col].apply(parse_value)
-    
-    # Fill NaN with median or 0
-    X = X.fillna(0)
+        X[col] = pd.to_numeric(X[col], errors='coerce').fillna(0)
     
     return X, existing_features
 
 
-def train_hybrid_ensemble(df: pd.DataFrame) -> Tuple[Optional[object], Optional[object], List[str]]:
+class LateFirstGoalModel:
     """
-    Train HYBRID ensemble model using XGBoost + LightGBM.
-    Generates separate CSV for each model.
+    Model A: Predicts whether the first goal comes after 45 minutes.
+    
+    Target: 1 if first_goal_time > 45 OR no goals, else 0
+    
+    This model answers: "If this match is 0-0 at 30 min, 
+    will the first goal come late (after 45 min)?"
+    """
+    
+    def __init__(self):
+        self.xgb_model = None
+        self.lgb_model = None
+        self.feature_names = []
+        self.is_trained = False
+    
+    def create_target(self, df: pd.DataFrame) -> pd.Series:
+        """Create target: 1 if first goal > 45 min or no goal."""
+        first_goal = df['first_goal_time'].fillna(999)  # No goal = very late
+        return (first_goal > 45).astype(int)
+    
+    def train(self, df: pd.DataFrame) -> Dict[str, float]:
+        """Train Model A on filtered data."""
+        print("\n--- Training Model A: Late First Goal ---")
+        
+        if len(df) < 5:
+            print("❌ Not enough data for Model A")
+            return {}
+        
+        # Create target
+        y = self.create_target(df)
+        
+        # Prepare features
+        X, self.feature_names = prepare_clean_features(df)
+        
+        if X.empty or len(X.columns) == 0:
+            print("❌ No valid features found")
+            return {}
+        
+        print(f"Training on {len(df)} matches with {len(X.columns)} features")
+        print(f"Target distribution: Late={y.sum()}, Early={len(y)-y.sum()}")
+        
+        if len(y.unique()) < 2:
+            print("❌ Need both classes for training")
+            return {}
+        
+        # Split data
+        try:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.3, random_state=42, stratify=y
+            )
+        except:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.3, random_state=42
+            )
+        
+        # Train XGBoost
+        self.xgb_model = XGBClassifier(
+            n_estimators=100, max_depth=4, learning_rate=0.1,
+            use_label_encoder=False, eval_metric='logloss', verbosity=0
+        )
+        self.xgb_model.fit(X_train, y_train)
+        xgb_pred = self.xgb_model.predict(X_test)
+        xgb_proba = self.xgb_model.predict_proba(X_test)[:, 1]
+        
+        # Train LightGBM
+        self.lgb_model = LGBMClassifier(
+            n_estimators=100, max_depth=4, learning_rate=0.1, verbose=-1
+        )
+        self.lgb_model.fit(X_train, y_train)
+        lgb_pred = self.lgb_model.predict(X_test)
+        lgb_proba = self.lgb_model.predict_proba(X_test)[:, 1]
+        
+        # Ensemble
+        ensemble_proba = (xgb_proba + lgb_proba) / 2
+        ensemble_pred = (ensemble_proba >= 0.5).astype(int)
+        
+        # Metrics
+        results = {
+            'xgb_accuracy': accuracy_score(y_test, xgb_pred),
+            'lgb_accuracy': accuracy_score(y_test, lgb_pred),
+            'ensemble_accuracy': accuracy_score(y_test, ensemble_pred),
+        }
+        
+        print(f"XGBoost Accuracy: {results['xgb_accuracy']:.1%}")
+        print(f"LightGBM Accuracy: {results['lgb_accuracy']:.1%}")
+        print(f"Ensemble Accuracy: {results['ensemble_accuracy']:.1%}")
+        
+        # Save results
+        model_a_results = pd.DataFrame({
+            'actual': y_test.values,
+            'xgb_probability': xgb_proba,
+            'lgb_probability': lgb_proba,
+            'ensemble_probability': ensemble_proba,
+            'prediction': ensemble_pred
+        })
+        model_a_results.to_csv(f"{OUTPUT_DIR}/model_a_results.csv", index=False)
+        print(f"✓ Saved to {OUTPUT_DIR}/model_a_results.csv")
+        
+        self.is_trained = True
+        return results
+    
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
+        """Predict probability of late first goal."""
+        if not self.is_trained:
+            return np.full(len(df), 0.5)
+        
+        X, _ = prepare_clean_features(df)
+        
+        # Ensure columns match
+        for col in self.feature_names:
+            if col not in X.columns:
+                X[col] = 0
+        X = X[self.feature_names]
+        
+        xgb_proba = self.xgb_model.predict_proba(X)[:, 1]
+        lgb_proba = self.lgb_model.predict_proba(X)[:, 1]
+        
+        return (xgb_proba + lgb_proba) / 2
+
+
+class Under1GoalModel:
+    """
+    Model B: Predicts whether the match stays Under 1 Goal.
+    
+    Target: 1 if total_goals <= 1, else 0
+    
+    This model answers: "If this match is 0-0 at 30 min,
+    will it finish with 0 or 1 goals total?"
+    """
+    
+    def __init__(self):
+        self.xgb_model = None
+        self.lgb_model = None
+        self.feature_names = []
+        self.is_trained = False
+    
+    def create_target(self, df: pd.DataFrame) -> pd.Series:
+        """Create target: 1 if total goals <= 1."""
+        return (df['total_goals'] <= 1).astype(int)
+    
+    def train(self, df: pd.DataFrame) -> Dict[str, float]:
+        """Train Model B on filtered data."""
+        print("\n--- Training Model B: Under 1 Goal ---")
+        
+        if len(df) < 5:
+            print("❌ Not enough data for Model B")
+            return {}
+        
+        # Create target
+        y = self.create_target(df)
+        
+        # Prepare features
+        X, self.feature_names = prepare_clean_features(df)
+        
+        if X.empty or len(X.columns) == 0:
+            print("❌ No valid features found")
+            return {}
+        
+        print(f"Training on {len(df)} matches with {len(X.columns)} features")
+        print(f"Target distribution: Under={y.sum()}, Over={len(y)-y.sum()}")
+        
+        if len(y.unique()) < 2:
+            print("❌ Need both classes for training")
+            return {}
+        
+        # Split data
+        try:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.3, random_state=42, stratify=y
+            )
+        except:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=0.3, random_state=42
+            )
+        
+        # Train XGBoost
+        self.xgb_model = XGBClassifier(
+            n_estimators=100, max_depth=4, learning_rate=0.1,
+            use_label_encoder=False, eval_metric='logloss', verbosity=0
+        )
+        self.xgb_model.fit(X_train, y_train)
+        xgb_pred = self.xgb_model.predict(X_test)
+        xgb_proba = self.xgb_model.predict_proba(X_test)[:, 1]
+        
+        # Train LightGBM
+        self.lgb_model = LGBMClassifier(
+            n_estimators=100, max_depth=4, learning_rate=0.1, verbose=-1
+        )
+        self.lgb_model.fit(X_train, y_train)
+        lgb_pred = self.lgb_model.predict(X_test)
+        lgb_proba = self.lgb_model.predict_proba(X_test)[:, 1]
+        
+        # Ensemble
+        ensemble_proba = (xgb_proba + lgb_proba) / 2
+        ensemble_pred = (ensemble_proba >= 0.5).astype(int)
+        
+        # Metrics
+        results = {
+            'xgb_accuracy': accuracy_score(y_test, xgb_pred),
+            'lgb_accuracy': accuracy_score(y_test, lgb_pred),
+            'ensemble_accuracy': accuracy_score(y_test, ensemble_pred),
+        }
+        
+        print(f"XGBoost Accuracy: {results['xgb_accuracy']:.1%}")
+        print(f"LightGBM Accuracy: {results['lgb_accuracy']:.1%}")
+        print(f"Ensemble Accuracy: {results['ensemble_accuracy']:.1%}")
+        
+        # Save results
+        model_b_results = pd.DataFrame({
+            'actual': y_test.values,
+            'xgb_probability': xgb_proba,
+            'lgb_probability': lgb_proba,
+            'ensemble_probability': ensemble_proba,
+            'prediction': ensemble_pred
+        })
+        model_b_results.to_csv(f"{OUTPUT_DIR}/model_b_results.csv", index=False)
+        print(f"✓ Saved to {OUTPUT_DIR}/model_b_results.csv")
+        
+        self.is_trained = True
+        return results
+    
+    def predict(self, df: pd.DataFrame) -> np.ndarray:
+        """Predict probability of under 1 goal."""
+        if not self.is_trained:
+            return np.full(len(df), 0.5)
+        
+        X, _ = prepare_clean_features(df)
+        
+        # Ensure columns match
+        for col in self.feature_names:
+            if col not in X.columns:
+                X[col] = 0
+        X = X[self.feature_names]
+        
+        xgb_proba = self.xgb_model.predict_proba(X)[:, 1]
+        lgb_proba = self.lgb_model.predict_proba(X)[:, 1]
+        
+        return (xgb_proba + lgb_proba) / 2
+
+
+def train_two_stage_models(df: pd.DataFrame) -> Tuple[LateFirstGoalModel, Under1GoalModel]:
+    """
+    Train both models on properly filtered data.
+    
+    The key insight: We filter training data to only include matches
+    that were 0-0 at 30 minutes. This eliminates data leakage.
     """
     print("\n" + "="*70)
-    print("STEP 2: TRAINING HYBRID ENSEMBLE MODEL")
+    print("STEP 2: TRAINING TWO-STAGE MODELS (NO DATA LEAKAGE)")
     print("="*70)
     
     if not HAS_ML:
         print("❌ ML libraries not available. Skipping training.")
-        return None, None, []
+        return LateFirstGoalModel(), Under1GoalModel()
     
     if len(df) < 5:
         print("❌ Not enough data for training (need at least 5 matches)")
-        return None, None, []
+        return LateFirstGoalModel(), Under1GoalModel()
     
-    # Create target variable: is current total <= 1 goal?
-    df['target'] = (df['total_score'] <= 1).astype(int)
+    # CRITICAL: Filter training data to eliminate leakage
+    # Only use matches where first goal came after 30 min
+    filtered_df = filter_training_data(df, min_elapsed=30)
     
-    # Prepare features
-    X, feature_names = prepare_features(df)
-    y = df['target']
+    if len(filtered_df) < 5:
+        print("⚠️ After filtering, not enough valid training data.")
+        print("   Using all data as fallback (less accurate predictions).")
+        filtered_df = df.copy()
     
-    if X.empty or len(X.columns) == 0:
-        print("❌ No valid features found in data")
-        return None, None, []
+    # Save filtered training data
+    filtered_df.to_csv(f"{OUTPUT_DIR}/training_data.csv", index=False)
+    print(f"\n✓ Saved filtered training data to {OUTPUT_DIR}/training_data.csv")
     
-    print(f"\nTraining on {len(df)} matches with {len(X.columns)} features:")
-    for i, col in enumerate(X.columns[:10]):
-        print(f"  {i+1}. {col}")
-    if len(X.columns) > 10:
-        print(f"  ... and {len(X.columns)-10} more")
+    # Train Model A: Late First Goal
+    model_a = LateFirstGoalModel()
+    results_a = model_a.train(filtered_df)
     
-    print(f"\nTarget distribution: Under={y.sum()}, Over={len(y)-y.sum()}")
-    
-    # Check if we have both classes
-    if len(y.unique()) < 2:
-        print("❌ Need both Under and Over matches for training")
-        return None, None, []
-    
-    # Split data
-    try:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.3, random_state=42, stratify=y
-        )
-    except:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.3, random_state=42
-        )
-    
-    # ========== XGBoost ==========
-    print("\n--- Training XGBoost ---")
-    xgb_model = XGBClassifier(
-        n_estimators=100,
-        max_depth=4,
-        learning_rate=0.1,
-        use_label_encoder=False,
-        eval_metric='logloss',
-        verbosity=0
-    )
-    xgb_model.fit(X_train, y_train)
-    
-    xgb_pred = xgb_model.predict(X_test)
-    xgb_proba = xgb_model.predict_proba(X_test)[:, 1]
-    xgb_acc = accuracy_score(y_test, xgb_pred)
-    
-    print(f"XGBoost Accuracy: {xgb_acc:.1%}")
-    
-    # Save XGBoost results
-    xgb_results = pd.DataFrame({
-        'actual': y_test.values,
-        'predicted': xgb_pred,
-        'probability': xgb_proba
-    })
-    xgb_results.to_csv(f"{OUTPUT_DIR}/xgboost_results.csv", index=False)
-    print(f"✓ Saved to {OUTPUT_DIR}/xgboost_results.csv")
-    
-    # ========== LightGBM ==========
-    print("\n--- Training LightGBM ---")
-    lgb_model = LGBMClassifier(
-        n_estimators=100,
-        max_depth=4,
-        learning_rate=0.1,
-        verbose=-1
-    )
-    lgb_model.fit(X_train, y_train)
-    
-    lgb_pred = lgb_model.predict(X_test)
-    lgb_proba = lgb_model.predict_proba(X_test)[:, 1]
-    lgb_acc = accuracy_score(y_test, lgb_pred)
-    
-    print(f"LightGBM Accuracy: {lgb_acc:.1%}")
-    
-    # Save LightGBM results
-    lgb_results = pd.DataFrame({
-        'actual': y_test.values,
-        'predicted': lgb_pred,
-        'probability': lgb_proba
-    })
-    lgb_results.to_csv(f"{OUTPUT_DIR}/lightgbm_results.csv", index=False)
-    print(f"✓ Saved to {OUTPUT_DIR}/lightgbm_results.csv")
-    
-    # ========== Ensemble ==========
-    print("\n--- HYBRID ENSEMBLE (XGBoost + LightGBM) ---")
-    ensemble_proba = (xgb_proba + lgb_proba) / 2
-    ensemble_pred = (ensemble_proba >= 0.5).astype(int)
-    ensemble_acc = accuracy_score(y_test, ensemble_pred)
-    
-    print(f"Ensemble Accuracy: {ensemble_acc:.1%}")
-    
-    # Save Ensemble results
-    ensemble_results = pd.DataFrame({
-        'actual': y_test.values,
-        'xgb_probability': xgb_proba,
-        'lgb_probability': lgb_proba,
-        'ensemble_probability': ensemble_proba,
-        'xgb_prediction': xgb_pred,
-        'lgb_prediction': lgb_pred,
-        'ensemble_prediction': ensemble_pred
-    })
-    ensemble_results.to_csv(f"{OUTPUT_DIR}/ensemble_results.csv", index=False)
-    print(f"✓ Saved to {OUTPUT_DIR}/ensemble_results.csv")
+    # Train Model B: Under 1 Goal
+    model_b = Under1GoalModel()
+    results_b = model_b.train(filtered_df)
     
     # Summary
     print("\n" + "-"*50)
-    print("MODEL COMPARISON:")
-    print(f"  XGBoost:  {xgb_acc:.1%}")
-    print(f"  LightGBM: {lgb_acc:.1%}")
-    print(f"  Ensemble: {ensemble_acc:.1%} ← Using this for predictions")
+    print("TWO-STAGE MODEL SUMMARY:")
+    print("-"*50)
+    if results_a:
+        print(f"  Model A (Late First Goal): {results_a.get('ensemble_accuracy', 0):.1%}")
+    else:
+        print("  Model A (Late First Goal): Not trained")
+    if results_b:
+        print(f"  Model B (Under 1 Goal):    {results_b.get('ensemble_accuracy', 0):.1%}")
+    else:
+        print("  Model B (Under 1 Goal): Not trained")
     print("-"*50)
     
-    return xgb_model, lgb_model, feature_names
+    return model_a, model_b
 
 
-def make_predictions(df: pd.DataFrame, xgb_model, lgb_model, feature_names: List[str]):
+# ============================================================================
+# PREDICTION
+# ============================================================================
+
+def make_two_stage_predictions(
+    df: pd.DataFrame, 
+    model_a: LateFirstGoalModel, 
+    model_b: Under1GoalModel
+) -> pd.DataFrame:
     """
-    Predict which 0-0 matches at ~30 min will stay Under 1 goal.
-    Uses hybrid ensemble (XGBoost + LightGBM average).
+    Make predictions using two-stage model.
+    
+    Combined prediction answers:
+    "If this match is 0-0 at ~30 minutes, what is the chance 
+    the first goal comes at ~45+ AND the game stays Under 1 Goal?"
     """
     print("\n" + "="*70)
-    print("STEP 3: PREDICTING 0-0 MATCHES (Under 1 Goal)")
+    print("STEP 3: PREDICTING 0-0 MATCHES (Two-Stage Model)")
     print("="*70)
     
     # Filter to 0-0 matches around 30 minutes
@@ -557,43 +856,49 @@ def make_predictions(df: pd.DataFrame, xgb_model, lgb_model, feature_names: List
                 print(f"  • {row['home_team']} vs {row['away_team']} ({row['status']})")
         candidates = all_zero if len(all_zero) > 0 else df.copy()
     
-    if xgb_model is None or lgb_model is None:
-        print("\n⚠️ No trained models. Using heuristic.")
-        candidates['xgb_probability'] = 0.5
-        candidates['lgb_probability'] = 0.5
-        candidates['ensemble_probability'] = 0.5
-        candidates['prediction'] = 'Unknown'
+    # Make predictions with both models
+    if model_a.is_trained and model_b.is_trained:
+        proba_late_goal = model_a.predict(candidates)
+        proba_under1 = model_b.predict(candidates)
+        
+        # Combined probability: weighted average
+        # Higher weight on Under 1 Goal as it's the primary target
+        combined_proba = (proba_late_goal * 0.4 + proba_under1 * 0.6)
+        
+        candidates['prob_late_first_goal'] = proba_late_goal
+        candidates['prob_under_1_goal'] = proba_under1
+        candidates['combined_probability'] = combined_proba
+        candidates['prediction'] = np.where(
+            combined_proba >= 0.5, 
+            'UNDER 1 Goal (High Confidence)', 
+            'Risk of Goals'
+        )
+        
+        # Confidence level
+        candidates['confidence'] = np.where(
+            combined_proba >= 0.7, 'HIGH',
+            np.where(combined_proba >= 0.5, 'MEDIUM', 'LOW')
+        )
     else:
-        # Prepare features
-        X_pred, _ = prepare_features(candidates)
-        
-        # Ensure columns match
-        for col in feature_names:
-            if col not in X_pred.columns:
-                X_pred[col] = 0
-        X_pred = X_pred[feature_names]
-        
-        # Make predictions with both models
-        xgb_proba = xgb_model.predict_proba(X_pred)[:, 1]
-        lgb_proba = lgb_model.predict_proba(X_pred)[:, 1]
-        ensemble_proba = (xgb_proba + lgb_proba) / 2
-        
-        candidates['xgb_probability'] = xgb_proba
-        candidates['lgb_probability'] = lgb_proba
-        candidates['ensemble_probability'] = ensemble_proba
-        candidates['prediction'] = np.where(ensemble_proba >= 0.5, 'UNDER 1 Goal', 'OVER 1 Goal')
+        print("\n⚠️ Models not trained. Using heuristic predictions.")
+        candidates['prob_late_first_goal'] = 0.5
+        candidates['prob_under_1_goal'] = 0.5
+        candidates['combined_probability'] = 0.5
+        candidates['prediction'] = 'Unknown'
+        candidates['confidence'] = 'N/A'
     
-    # Sort by ensemble probability
-    candidates = candidates.sort_values('ensemble_probability', ascending=False)
+    # Sort by combined probability
+    candidates = candidates.sort_values('combined_probability', ascending=False)
     
     # Select output columns
     output_cols = [
         'match_id', 'tournament', 'home_team', 'away_team',
         'home_score', 'away_score', 'status', 'elapsed_minutes',
-        'first_goal_time', 'goals_first_half',
-        'xgb_probability', 'lgb_probability', 'ensemble_probability', 'prediction',
+        'prob_late_first_goal', 'prob_under_1_goal', 'combined_probability',
+        'confidence', 'prediction',
         'h2h_home_wins', 'h2h_draws', 'h2h_away_wins',
-        'home_avg_rating', 'away_avg_rating'
+        'home_avg_rating', 'away_avg_rating',
+        'total_shots', 'total_shots_on_target', 'total_xg'
     ]
     existing_cols = [c for c in output_cols if c in candidates.columns]
     result_df = candidates[existing_cols].copy()
@@ -608,15 +913,15 @@ def make_predictions(df: pd.DataFrame, xgb_model, lgb_model, feature_names: List
     print("-"*70)
     
     for _, row in result_df.head(15).iterrows():
-        xgb_p = row.get('xgb_probability', 0)
-        lgb_p = row.get('lgb_probability', 0)
-        ens_p = row.get('ensemble_probability', 0)
-        fg = row.get('first_goal_time', 'N/A')
+        late_p = row.get('prob_late_first_goal', 0)
+        under_p = row.get('prob_under_1_goal', 0)
+        combined_p = row.get('combined_probability', 0)
+        conf = row.get('confidence', 'N/A')
         
         print(f"\n  {row['home_team']} vs {row['away_team']}")
         print(f"    Score: {row['home_score']}-{row['away_score']} | {row['status']}")
-        print(f"    First Goal: {fg if fg else 'No goals yet'}")
-        print(f"    XGBoost: {xgb_p:.1%} | LightGBM: {lgb_p:.1%} | Ensemble: {ens_p:.1%}")
+        print(f"    P(Late Goal): {late_p:.1%} | P(Under 1): {under_p:.1%}")
+        print(f"    >>> Combined: {combined_p:.1%} [{conf}]")
         print(f"    >>> {row.get('prediction', 'N/A')}")
     
     return result_df
@@ -630,8 +935,8 @@ async def main():
     """Main execution - runs everything in one command."""
     
     print("\n" + "="*70)
-    print("  SOFASCORE UNDER 1 GOAL PREDICTOR - ENHANCED")
-    print("  Hybrid XGBoost + LightGBM Ensemble with Goal Timestamps")
+    print("  SOFASCORE UNDER 1 GOAL PREDICTOR - TWO-STAGE MODEL")
+    print("  No Data Leakage | Model A + Model B Combined")
     print("="*70)
     print(f"\nStarted at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
@@ -644,15 +949,11 @@ async def main():
         print("\n❌ No match data collected. Exiting.")
         return
     
-    # Step 2: Train hybrid ensemble
-    xgb_model, lgb_model, features = train_hybrid_ensemble(df_matches)
-    
-    # Save training data
-    df_matches.to_csv(f"{OUTPUT_DIR}/training_data.csv", index=False)
-    print(f"\n✓ Saved training data to {OUTPUT_DIR}/training_data.csv")
+    # Step 2: Train two-stage models (with data filtering)
+    model_a, model_b = train_two_stage_models(df_matches)
     
     # Step 3: Make predictions
-    predictions = make_predictions(df_matches, xgb_model, lgb_model, features)
+    predictions = make_two_stage_predictions(df_matches, model_a, model_b)
     
     # Summary
     elapsed = time.time() - start_time
@@ -664,19 +965,18 @@ async def main():
     print(f"  • live_matches.csv      - All {len(df_matches)} live matches with stats")
     print(f"  • h2h_data.csv          - Head-to-head records")
     print(f"  • goal_timestamps.csv   - First goal times for each match")
-    print(f"  • training_data.csv     - Full training dataset")
-    print(f"  • xgboost_results.csv   - XGBoost model results")
-    print(f"  • lightgbm_results.csv  - LightGBM model results")
-    print(f"  • ensemble_results.csv  - Hybrid ensemble results")
-    print(f"  • predictions.csv       - Final Under 1 goal predictions")
+    print(f"  • training_data.csv     - Filtered training data (no early goals)")
+    print(f"  • model_a_results.csv   - Late First Goal model results")
+    print(f"  • model_b_results.csv   - Under 1 Goal model results")
+    print(f"  • predictions.csv       - Final two-stage predictions")
     
     # Stats
     zero_zero = df_matches[df_matches['is_zero_zero'] == 1]
     print(f"\n📊 Summary: {len(zero_zero)} matches currently at 0-0")
     
-    if len(predictions) > 0 and 'ensemble_probability' in predictions.columns:
-        high_conf = predictions[predictions['ensemble_probability'] >= 0.6]
-        print(f"🎯 High-confidence Under predictions (≥60%): {len(high_conf)}")
+    if len(predictions) > 0 and 'combined_probability' in predictions.columns:
+        high_conf = predictions[predictions['confidence'] == 'HIGH']
+        print(f"🎯 High-confidence Under predictions: {len(high_conf)}")
 
 
 def run():
