@@ -1,0 +1,14 @@
+# Core data / numerical stack
+pandas>=1.5.0
+numpy>=1.23.0
+
+# Machine learning
+scikit-learn>=1.2.0
+xgboost>=1.7.0
+lightgbm>=4.0.0
+
+# Sofascore API wrapper
+sofascore-wrapper>=1.0.0
+
+# Async support (generally comes with Python, but pinned for clarity)
+aiohttp>=3.8.0
