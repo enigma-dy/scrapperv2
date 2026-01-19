@@ -1,18 +1,15 @@
 """
-Basketball Over/Under Prediction System
-========================================
+NCAA Basketball Over/Under Prediction System
+=============================================
 
-Predicts whether basketball games will go Over or Under the bookmaker's
+Predicts whether NCAA basketball games will go Over or Under the bookmaker's
 total points line using team statistics, H2H data, and ensemble ML models.
 
-Focuses on TOP basketball leagues (NBA, EuroLeague, ACB, etc.)
-Gets upcoming matches for TODAY and TOMORROW only.
-
-Usage: python basketball_predictor.py
+Usage: python ncaa_prediction.py
 
 Output CSVs (with timestamp):
-- data/basketball_predictions_YYYY-MM-DD_HH-MM.csv    - Predictions with picks
-- data/basketball_predictions_YYYY-MM-DD_HH-MM.result.csv - Results template
+- data/ncaa_predictions_YYYY-MM-DD_HH-MM.csv    - Predictions with picks
+- data/ncaa_predictions_YYYY-MM-DD_HH-MM.result.csv - Results template
 """
 
 import asyncio
@@ -57,7 +54,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Generate timestamp for unique filenames
 RUN_TIMESTAMP = datetime.now().strftime('%Y-%m-%d_%H-%M')
-FILENAME_PREFIX = f"basketball_predictions_{RUN_TIMESTAMP}"
+FILENAME_PREFIX = f"ncaa_predictions_{RUN_TIMESTAMP}"
 
 # Time between API requests to avoid rate limiting
 REQUEST_DELAY = 0.5
@@ -66,37 +63,16 @@ REQUEST_DELAY = 0.5
 MIN_TRAINING_SAMPLES = 30
 MIN_TEAM_MATCHES = 4
 
-# Statistical fallbacks for basketball
-DEFAULT_AVG_TOTAL = 215.0  # Average top league basketball game total
-DEFAULT_AVG_SCORED = 107.5
-DEFAULT_LINE = 215.0
+# Statistical fallbacks
+DEFAULT_AVG_TOTAL = 145.0  # Average NCAA game total
+DEFAULT_AVG_SCORED = 72.5
+DEFAULT_LINE = 145.0
 
-# Top Basketball Leagues (by SofaScore tournament ID)
-# EXCLUDING all NBA and USA basketball - focusing ONLY on international leagues
-TOP_BASKETBALL_LEAGUES = {
-    # Europe
-    138: "EuroLeague",
-    256: "EuroCup",
-    141: "Spanish ACB",
-    268: "Turkish BSL",
-    142: "German BBL",
-    146: "Italian Lega Basket Serie A",
-    147: "French Pro A",
-    143: "Greek A1",
-    151: "Russian VTB United League",
-    148: "Lithuanian LKL",
-    144: "Serbian ABA League",
-    149: "Israeli Basketball Premier League",
-    # Asia
-    270: "Chinese CBA",
-    278: "Japanese B.League",
-    279: "Korean KBL",
-    280: "Philippine PBA",
-    # Oceania
-    271: "Australian NBL",
-    # South America
-    254: "Brazilian NBB",
-    277: "Argentine LNB",
+# NCAA Basketball Leagues (discovered from SofaScore)
+NCAA_LEAGUES = {
+    132: "NCAA Men's Basketball",
+    133: "NCAA Women's Basketball",
+    # Will discover more via search
 }
 
 
@@ -132,7 +108,7 @@ def parse_odds_line(odds_data: Dict) -> Optional[float]:
                     for choice in choices:
                         name = choice.get('name', '').lower()
                         if 'over' in name or 'under' in name:
-                            # Extract line from name like "Over 215.5"
+                            # Extract line from name like "Over 145.5"
                             parts = name.split()
                             for part in parts:
                                 try:
@@ -144,71 +120,12 @@ def parse_odds_line(odds_data: Dict) -> Optional[float]:
         return None
 
 
-def is_top_league(event: Dict) -> bool:
-    """Check if event is from a top basketball league (EXCLUDING all NBA/USA basketball)."""
-    tournament = event.get('tournament', {})
-    unique_tournament = tournament.get('uniqueTournament', {})
-    tournament_id = unique_tournament.get('id', 0)
-    tournament_name = unique_tournament.get('name', '').lower()
-    category = unique_tournament.get('category', {})
-    category_name = category.get('name', '').lower() if isinstance(category, dict) else ''
-    
-    # STRICTLY EXCLUDE all USA basketball (NBA, NCAA, G-League, WNBA, college, etc.)
-    usa_categories = ['usa', 'united states', 'us', 'america', 'american']
-    if any(cat in category_name for cat in usa_categories):
-        return False
-    
-    # Exclude by tournament name - comprehensive list of USA basketball terms
-    usa_exclusion_terms = [
-        'nba', 'ncaa', 'g-league', 'g league', 'wnba', 
-        'big east', 'big ten', 'big 12', 'big twelve',
-        'acc', 'sec ', 'pac-12', 'pac 12', 'big west',
-        'mountain west', 'atlantic 10', 'american athletic',
-        'conference usa', 'sun belt', 'missouri valley',
-        'west coast', 'ivy league', 'patriot league',
-        'horizon league', 'summit league', 'ohio valley',
-        'southland', 'colonial', 'america east', 'maac',
-        'nec', 'asun', 'wac', 'swac', 'meac', 'big sky',
-        'college', 'university', 'wildcats', 'bulldogs',
-        'cavaliers', 'thunder', 'rockets', 'celtics',
-        'wolves', 'nets', 'clippers', 'warriors', 'heat',
-        'mavericks', 'spurs', 'jazz', 'knicks', 'bucks',
-        'pistons', 'lakers', 'suns', 'nuggets', '76ers',
-        'hawks', 'wizards', 'kings', 'pacers', 'raptors',
-        'blue', 'charge', 'gold', 'herd', 'hustle', 'legends',
-        'vipers', 'remix', 'boom', 'legion', 'squadron'
-    ]
-    
-    for term in usa_exclusion_terms:
-        if term in tournament_name:
-            return False
-    
-    # Check by ID first for known top leagues
-    if tournament_id in TOP_BASKETBALL_LEAGUES:
-        return True
-    
-    # Check by name patterns for international leagues only
-    top_keywords = [
-        'euroleague', 'acb', 'eurocup', 'vtb', 
-        'serie a', 'lega basket', 'bundesliga', 'pro a',
-        'a1 ethniki', 'turkish', 'bsl', 'lkl', 'cba',
-        'nbl', 'nbb', 'liga endesa', 'aba league',
-        'b.league', 'kbl', 'pba', 'israeli'
-    ]
-    
-    for keyword in top_keywords:
-        if keyword in tournament_name:
-            return True
-    
-    return False
-
-
 # ============================================================================
 # DATA COLLECTION
 # ============================================================================
 
-class BasketballDataCollector:
-    """Collects basketball data for prediction."""
+class NCAADataCollector:
+    """Collects NCAA basketball data for prediction."""
     
     def __init__(self):
         self.api = SofascoreAPI()
@@ -218,6 +135,28 @@ class BasketballDataCollector:
     
     async def close(self):
         await self.api.close()
+    
+    async def search_ncaa_leagues(self) -> List[Dict]:
+        """Search for NCAA basketball leagues/tournaments."""
+        leagues = []
+        try:
+            search = Search(self.api, "NCAA", 0)
+            results = await search.search_leagues(sport="basketball")
+            
+            if results:
+                print("\n📋 Found NCAA Basketball Leagues:")
+                for item in results:
+                    if isinstance(item, dict):
+                        entity = item.get('entity', item)
+                        name = entity.get('name', 'Unknown')
+                        league_id = entity.get('id', 0)
+                        if 'ncaa' in name.lower() or 'college' in name.lower():
+                            print(f"  • {name} (ID: {league_id})")
+                            leagues.append(entity)
+        except Exception as e:
+            print(f"⚠️ Search error: {e}")
+        
+        return leagues
     
     async def get_basketball_games(self, date: str = None) -> List[Dict]:
         """Get basketball games for a specific date."""
@@ -230,8 +169,18 @@ class BasketballDataCollector:
             
             if games and 'events' in games:
                 for event in games['events']:
-                    # Filter for top basketball leagues only
-                    if is_top_league(event):
+                    tournament = event.get('tournament', {})
+                    unique_tournament = tournament.get('uniqueTournament', {})
+                    category = unique_tournament.get('category', {})
+                    
+                    # Filter for NCAA/US College basketball
+                    category_name = category.get('name', '').lower()
+                    tournament_name = unique_tournament.get('name', '').lower()
+                    
+                    is_ncaa = any(term in tournament_name for term in ['ncaa', 'college', 'ncaab'])
+                    is_usa = category_name in ['usa', 'united states', 'us']
+                    
+                    if is_ncaa or (is_usa and 'college' in tournament_name):
                         all_games.append(event)
             
             await asyncio.sleep(REQUEST_DELAY)
@@ -242,14 +191,13 @@ class BasketballDataCollector:
         return all_games
     
     async def get_upcoming_matches(self) -> List[Dict]:
-        """Get upcoming basketball matches for today and tomorrow only."""
+        """Get upcoming NCAA basketball matches."""
         upcoming = []
         
-        # Today and tomorrow only
+        # Try today and tomorrow
         for day_offset in range(2):
             date = (datetime.now() + timedelta(days=day_offset)).strftime('%Y-%m-%d')
-            day_name = "Today" if day_offset == 0 else "Tomorrow"
-            print(f"\n  Checking games for {date} ({day_name})...")
+            print(f"\n  Checking games for {date}...")
             
             games = await self.get_basketball_games(date)
             
@@ -257,19 +205,11 @@ class BasketballDataCollector:
                 status_code = safe_get(event, 'status', 'code', default=100)
                 # Status 0 = not started
                 if status_code == 0:
-                    tournament_data = event.get('tournament', {})
-                    unique_tournament = tournament_data.get('uniqueTournament', {}) if isinstance(tournament_data, dict) else {}
-                    tournament_name = unique_tournament.get('name', 'Unknown') if isinstance(unique_tournament, dict) else 'Unknown'
-                    tournament_id = unique_tournament.get('id', 0) if isinstance(unique_tournament, dict) else 0
                     upcoming.append({
                         'event': event,
                         'date': date,
-                        'day': day_name,
-                        'tournament': tournament_name,
-                        'tournament_id': tournament_id,
+                        'tournament': safe_get(event, 'tournament', 'uniqueTournament', 'name'),
                     })
-            
-            print(f"    Found {len([m for m in upcoming if m['date'] == date])} upcoming top league matches")
         
         return upcoming
     
@@ -317,7 +257,7 @@ class BasketballDataCollector:
                                     else safe_get(event, 'homeTeam', 'name'),
                     'result': result,
                     'is_win': 1 if result == 'W' else 0,
-                    'is_over_215': 1 if total_points > 215 else 0,
+                    'is_over_145': 1 if total_points > 145 else 0,
                     'match_index': len(matches),  # 0 = most recent
                 }
                 matches.append(match_data)
@@ -421,8 +361,8 @@ class BasketballDataCollector:
             except:
                 pass
         
-        # Over rate (games > 215 total for top leagues)
-        over_rate = df['is_over_215'].mean() if 'is_over_215' in df.columns else 0.5
+        # Over rate (games > 145 total)
+        over_rate = df['is_over_145'].mean() if 'is_over_145' in df.columns else 0.5
         
         # Home/Away scoring averages
         home_matches = df[df['is_home'] == True] if 'is_home' in df.columns else pd.DataFrame()
@@ -500,8 +440,8 @@ class BasketballDataCollector:
                 if totals:
                     h2h_stats['h2h_matches'] = len(totals)
                     h2h_stats['h2h_avg_total'] = sum(totals) / len(totals)
-                    # Calculate over tendency (using typical line of 215)
-                    h2h_stats['h2h_over_tendency'] = sum(1 for t in totals if t > 215) / len(totals)
+                    # Calculate over tendency (using typical line of 145)
+                    h2h_stats['h2h_over_tendency'] = sum(1 for t in totals if t > 145) / len(totals)
                     
         except Exception as e:
             pass  # Use defaults
@@ -527,26 +467,35 @@ class BasketballDataCollector:
     async def collect_all_data(self) -> Tuple[List[Dict], Dict, pd.DataFrame]:
         """Collect all data for prediction."""
         print("\n" + "="*70)
-        print("STEP 1: SEARCHING FOR TOP BASKETBALL LEAGUE MATCHES")
+        print("STEP 1: SEARCHING FOR NCAA BASKETBALL MATCHES")
         print("="*70)
-        print("\nTarget leagues: NBA, EuroLeague, ACB, BBL, Lega Basket, etc.")
+        
+        # Search for leagues first
+        await self.search_ncaa_leagues()
         
         # Get upcoming matches
         upcoming = await self.get_upcoming_matches()
         
-        print(f"\n✓ Found {len(upcoming)} upcoming top league matches")
+        print(f"\n✓ Found {len(upcoming)} upcoming NCAA matches")
+        
+        if not upcoming:
+            # Try broader basketball search
+            print("\n  Trying broader basketball search...")
+            for day_offset in range(2):
+                date = (datetime.now() + timedelta(days=day_offset)).strftime('%Y-%m-%d')
+                games = await self.get_basketball_games(date)
+                for event in games:
+                    status_code = safe_get(event, 'status', 'code', default=100)
+                    if status_code == 0:
+                        upcoming.append({
+                            'event': event,
+                            'date': date,
+                            'tournament': safe_get(event, 'tournament', 'uniqueTournament', 'name'),
+                        })
+            print(f"  Found {len(upcoming)} total basketball matches")
         
         if not upcoming:
             return [], {}, pd.DataFrame()
-        
-        # Group by tournament for display
-        by_tournament = defaultdict(list)
-        for match in upcoming:
-            by_tournament[match['tournament']].append(match)
-        
-        print("\n📋 Matches by League:")
-        for tourn, matches in sorted(by_tournament.items(), key=lambda x: -len(x[1])):
-            print(f"   • {tourn}: {len(matches)} matches")
         
         # Collect team data
         print("\n" + "="*70)
@@ -699,22 +648,22 @@ def create_prediction_features(match_info: Dict, team_stats: Dict) -> Dict[str, 
         'combined_avg_scored': (home_stats.get('avg_scored', DEFAULT_AVG_SCORED) + 
                                 away_stats.get('avg_scored', DEFAULT_AVG_SCORED)),
         
-        # Recent Performance / Win Rate
+        # NEW: Recent Performance / Win Rate
         'home_win_rate': home_stats.get('win_rate', 0.5),
         'away_win_rate': away_stats.get('win_rate', 0.5),
         
-        # Momentum (weighted recent form)
+        # NEW: Momentum (weighted recent form)
         'home_momentum': home_stats.get('momentum_score', 0.0),
         'away_momentum': away_stats.get('momentum_score', 0.0),
         'momentum_diff': home_stats.get('momentum_score', 0.0) - away_stats.get('momentum_score', 0.0),
         
-        # Scoring/Conceding Trends
+        # NEW: Scoring/Conceding Trends
         'home_scoring_trend': home_stats.get('scoring_trend', 0.0),
         'away_scoring_trend': away_stats.get('scoring_trend', 0.0),
         'home_conceding_trend': home_stats.get('conceding_trend', 0.0),
         'away_conceding_trend': away_stats.get('conceding_trend', 0.0),
         
-        # Pace & Scoring Style
+        # NEW: Pace & Scoring Style
         'home_pace': home_pace,
         'away_pace': away_pace,
         'combined_pace': combined_pace,
@@ -722,17 +671,17 @@ def create_prediction_features(match_info: Dict, team_stats: Dict) -> Dict[str, 
         'away_over_rate': away_stats.get('over_rate', 0.5),
         'combined_over_rate': combined_over_rate,
         
-        # Consistency (lower std = more predictable)
+        # NEW: Consistency (lower std = more predictable)
         'home_std_dev_scored': home_stats.get('std_dev_scored', 10.0),
         'away_std_dev_scored': away_stats.get('std_dev_scored', 10.0),
         'home_std_dev_total': home_stats.get('std_dev_total', 15.0),
         'away_std_dev_total': away_stats.get('std_dev_total', 15.0),
         
-        # Recent form (last 3 games)
+        # NEW: Recent form (last 3 games)
         'home_last_3_avg': home_stats.get('last_3_avg_total', DEFAULT_AVG_TOTAL),
         'away_last_3_avg': away_stats.get('last_3_avg_total', DEFAULT_AVG_TOTAL),
         
-        # Streaks
+        # NEW: Streaks
         'home_streak': home_stats.get('streak', 0),
         'away_streak': away_stats.get('streak', 0),
         
@@ -760,7 +709,7 @@ def create_prediction_features(match_info: Dict, team_stats: Dict) -> Dict[str, 
 # ML MODEL
 # ============================================================================
 
-class BasketballOverUnderModel:
+class NCAAOverUnderModel:
     """Hybrid Ensemble model for Over/Under predictions with stacking."""
     
     def __init__(self):
@@ -787,7 +736,7 @@ class BasketballOverUnderModel:
         # Use ALL available features from historical matches
         all_features = [
             'points_scored', 'points_conceded', 'is_home', 
-            'is_win', 'is_over_215', 'match_index'
+            'is_win', 'is_over_145', 'match_index'
         ]
         existing = [c for c in all_features if c in df.columns]
         
@@ -896,7 +845,7 @@ class BasketballOverUnderModel:
         away_scoring_trend = features.get('away_scoring_trend', 0)
         
         # Momentum adjustment (hot teams score more)
-        momentum_adjustment = (home_momentum + away_momentum) * 2.0
+        momentum_adjustment = (home_momentum + away_momentum) * 1.5
         
         # Trend adjustment (improving teams score more)
         trend_adjustment = (home_scoring_trend + away_scoring_trend) * 0.5
@@ -907,17 +856,17 @@ class BasketballOverUnderModel:
         # Factor in over rates
         combined_over_rate = features.get('combined_over_rate', 0.5)
         if combined_over_rate > 0.6:
-            predicted_total += 2.0  # Teams that play high scoring games
+            predicted_total += 1.5  # Teams that play high scoring games
         elif combined_over_rate < 0.4:
-            predicted_total -= 2.0  # Teams that play low scoring games
+            predicted_total -= 1.5  # Teams that play low scoring games
         
         # Calculate edge
         edge = predicted_total - bookie_line
         
-        # Determine pick with ADJUSTED thresholds (2d for basketball due to higher variance)
-        if edge > 2.0:
+        # Determine pick with ADJUSTED thresholds (1.5 instead of 2)
+        if edge > 1.5:
             pick = 'OVER'
-        elif edge < -2.0:
+        elif edge < -1.5:
             pick = 'UNDER'
         else:
             pick = 'LEAN OVER' if edge > 0 else 'LEAN UNDER'
@@ -940,11 +889,11 @@ class BasketballOverUnderModel:
         quality_score = data_quality + h2h_bonus + consistency_bonus
         
         # ADJUSTED thresholds for confidence
-        if abs_edge >= 5 and quality_score >= 3:
+        if abs_edge >= 4 and quality_score >= 3:
             confidence = 'HIGH'
-        elif abs_edge >= 3 and quality_score >= 2:
+        elif abs_edge >= 2.5 and quality_score >= 2:
             confidence = 'MEDIUM'
-        elif abs_edge >= 2:
+        elif abs_edge >= 1.5:
             confidence = 'LOW'
         else:
             confidence = 'INSUFFICIENT_EDGE'
@@ -957,7 +906,7 @@ class BasketballOverUnderModel:
 # ============================================================================
 
 def make_predictions(upcoming_matches: List[Dict], team_stats: Dict,
-                     model: BasketballOverUnderModel) -> pd.DataFrame:
+                     model: NCAAOverUnderModel) -> pd.DataFrame:
     """Make predictions for all upcoming matches."""
     print("\n" + "="*70)
     print("STEP 4: MAKING PREDICTIONS")
@@ -980,7 +929,6 @@ def make_predictions(upcoming_matches: List[Dict], team_stats: Dict,
         
         pred = {
             'match_id': event.get('id'),
-            'day': match_info.get('day', ''),
             'tournament': match_info.get('tournament', 'Unknown'),
             'home_team': safe_get(event, 'homeTeam', 'name', default='Unknown'),
             'away_team': safe_get(event, 'awayTeam', 'name', default='Unknown'),
@@ -1013,7 +961,7 @@ def make_predictions(upcoming_matches: List[Dict], team_stats: Dict,
         print(f"\n✓ Saved {len(df_pred)} predictions to {predictions_file}")
         
         # Create results template
-        df_results = df_pred[['match_id', 'day', 'tournament', 'home_team', 'away_team',
+        df_results = df_pred[['match_id', 'tournament', 'home_team', 'away_team',
                               'kickoff_time', 'bookie_line', 'predicted_total',
                               'pick', 'confidence']].copy()
         df_results['actual_home_score'] = ''
@@ -1043,7 +991,7 @@ def make_predictions(upcoming_matches: List[Dict], team_stats: Dict,
         direction = "📈" if edge > 0 else "📉"
         
         print(f"\n  {row['home_team']} vs {row['away_team']}")
-        print(f"    {row['day']} | {row['tournament']} | Kickoff: {row['kickoff_time']}")
+        print(f"    Tournament: {row['tournament']} | Kickoff: {row['kickoff_time']}")
         print(f"    Bookie Line: {line} | Predicted: {pred_total} | Edge: {edge:+.1f}")
         print(f"    {direction} >>> {pick} ({conf}) <<<")
     
@@ -1057,42 +1005,41 @@ def make_predictions(upcoming_matches: List[Dict], team_stats: Dict,
 async def main():
     """Main execution."""
     print("\n" + "="*70)
-    print("  TOP BASKETBALL LEAGUES OVER/UNDER PREDICTOR")
+    print("  NCAA BASKETBALL OVER/UNDER PREDICTOR")
     print("  Team Stats + H2H + Ensemble ML")
-    print("  (Today & Tomorrow Only)")
     print("="*70)
     print(f"\nStarted at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     start_time = time.time()
     
     # Collect data
-    collector = BasketballDataCollector()
+    collector = NCAADataCollector()
     try:
         upcoming, team_stats, df_historical = await collector.collect_all_data()
     finally:
         await collector.close()
     
     if not upcoming:
-        print("\n❌ No upcoming top basketball league matches found.")
+        print("\n❌ No upcoming NCAA basketball matches found.")
         print("   This may be because:")
         print("   • No games scheduled today/tomorrow")
-        print("   • Season may be off for target leagues")
-        print("   Try running on a day with known games.")
+        print("   • NCAA season may be off")
+        print("   Try running on a day with known NCAA games.")
         return
     
     # Save team stats
     if team_stats:
         df_stats = pd.DataFrame.from_dict(team_stats, orient='index')
-        df_stats.to_csv(f"{OUTPUT_DIR}/basketball_team_stats.csv", index=True)
+        df_stats.to_csv(f"{OUTPUT_DIR}/ncaa_team_stats.csv", index=True)
         print(f"\n✓ Saved team stats")
     
     # Save historical data
     if not df_historical.empty:
-        df_historical.to_csv(f"{OUTPUT_DIR}/basketball_historical.csv", index=False)
+        df_historical.to_csv(f"{OUTPUT_DIR}/ncaa_historical.csv", index=False)
         print(f"✓ Saved {len(df_historical)} historical matches")
     
     # Train model
-    model = BasketballOverUnderModel()
+    model = NCAAOverUnderModel()
     if HAS_ML and not df_historical.empty:
         model.train(df_historical)
     else:
@@ -1110,8 +1057,8 @@ async def main():
     print(f"\nGenerated files in '{OUTPUT_DIR}/' folder:")
     print(f"  • {FILENAME_PREFIX}.csv         - {len(predictions)} predictions")
     print(f"  • {FILENAME_PREFIX}.result.csv  - Results template")
-    print(f"  • basketball_team_stats.csv     - Team statistics")
-    print(f"  • basketball_historical.csv     - Historical matches")
+    print(f"  • ncaa_team_stats.csv           - Team statistics")
+    print(f"  • ncaa_historical.csv           - Historical matches")
     
     if not predictions.empty:
         high_conf = predictions[predictions['confidence'] == 'HIGH']

@@ -1,14 +1,32 @@
-# Core data / numerical stack
+# =============================================================================
+# Sports Prediction Suite - Requirements
+# =============================================================================
+# Install all dependencies with: pip install -r requirements.txt
+# =============================================================================
+
+# Core data processing and numerical computation
 pandas>=1.5.0
 numpy>=1.23.0
 
-# Machine learning
+# Machine Learning - Core
 scikit-learn>=1.2.0
+
+# Machine Learning - Gradient Boosting (XGBoost & LightGBM)
 xgboost>=1.7.0
 lightgbm>=4.0.0
 
-# Sofascore API wrapper
+# Sofascore API wrapper for sports data
 sofascore-wrapper>=1.0.0
 
-# Async support (generally comes with Python, but pinned for clarity)
+# Async HTTP client (used by sofascore-wrapper)
 aiohttp>=3.8.0
+
+# Standard library modules used (no install needed):
+# - asyncio (async/await support)
+# - datetime (date handling)
+# - time (delays, timing)
+# - json (data serialization)
+# - os (file operations)
+# - warnings (warning suppression)
+# - collections (defaultdict)
+# - typing (type hints)
